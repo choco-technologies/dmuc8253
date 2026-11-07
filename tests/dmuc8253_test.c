@@ -36,6 +36,11 @@ DMOD_TEST_STEP(validate_rejects_bad_configurations)
     c = panel();
     c.rotation = (dmuc8253_rotation_t)4;
     DMOD_TEST_EXPECT_FALSE(dmuc8253_validate_config(&c));
+    c = panel();
+    c.mirror = (dmuc8253_mirror_t)4;
+    DMOD_TEST_EXPECT_FALSE(dmuc8253_validate_config(&c));
+    c.mirror = dmuc8253_mirror_xy;
+    DMOD_TEST_EXPECT_TRUE(dmuc8253_validate_config(&c));
 }
 
 DMOD_TEST_STEP(color_to_mono)

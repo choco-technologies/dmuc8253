@@ -36,6 +36,8 @@
 #define DMUC8253_CONTEXT_MAGIC      0x55433832
 
 #define CMD_PSR                     0x00    /* panel setting */
+#define PSR_UD                      0x08    /* the lines scanned up (G0 first) */
+#define PSR_SHL                     0x04    /* the columns shifted right (S0 first) */
 #define CMD_POF                     0x02    /* power off */
 #define CMD_PON                     0x04    /* power on */
 #define CMD_DTM1                    0x10    /* the old picture (what is on the screen) */
@@ -80,6 +82,7 @@ struct dmdrvi_context
     node_t              reset;
     bool                reset_wired;        /**< The configuration says there is a reset line to wait for */
     bool                started;            /**< The panel was initialised and shows the framebuffer */
+    bool                awake;              /**< The controller has been reset once (by the line, when there is one) */
     bool                display_enabled;
     uint32_t            partial_count;      /**< Partial refreshes since the last full one */
     area_t              dirty;              /**< Written through write() / FILL_RECT, not presented yet */
@@ -95,6 +98,8 @@ static bool is_valid_context(dmdrvi_context_t context)
 dmod_dmuc8253_api_declaration(1.0, bool, _validate_config, ( const dmuc8253_config_t *config ))
 {
     if (config == NULL || config->width == 0 || config->height == 0 || config->rotation > dmuc8253_rotation_270)
+        return false;
+    if (config->mirror > dmuc8253_mirror_xy)
         return false;
     return config->width <= UC8253_PANEL_MAX_WIDTH && config->height <= UC8253_PANEL_MAX_HEIGHT && (config->width % 8U) == 0U;
 }
@@ -157,6 +162,7 @@ static int read_config(dmdrvi_context_t context, dmini_context_t ini)
     int rotation = dmini_get_int(ini, NULL, "rotation", 0);
     const char *clear = dmini_get_string(ini, NULL, "clear_color", NULL);
     int interval = dmini_get_int(ini, NULL, "full_refresh_interval", 0);
+    const char *mirror = dmini_get_string(ini, NULL, "mirror", "none");
 
     context->instance = (uint8_t)dmini_get_int(ini, NULL, "instance", 0);
     c->width    = (uint16_t)dmini_get_int(ini, NULL, "width", (int)UC8253_PANEL_MAX_WIDTH);
@@ -169,6 +175,19 @@ static int read_config(dmdrvi_context_t context, dmini_context_t ini)
         return -EINVAL;
     }
     c->rotation = (dmuc8253_rotation_t)(rotation / 90);
+    if (strcmp(mirror, "none") == 0)
+        c->mirror = dmuc8253_mirror_none;
+    else if (strcmp(mirror, "x") == 0)
+        c->mirror = dmuc8253_mirror_x;
+    else if (strcmp(mirror, "y") == 0)
+        c->mirror = dmuc8253_mirror_y;
+    else if (strcmp(mirror, "xy") == 0)
+        c->mirror = dmuc8253_mirror_xy;
+    else
+    {
+        DMOD_LOG_ERROR("Invalid mirror '%s' (none, x, y or xy)\n", mirror);
+        return -EINVAL;
+    }
     if (interval < 0 || interval > 0xFFFF)
     {
         DMOD_LOG_ERROR("Invalid full_refresh_interval %d (0..65535)\n", interval);
@@ -289,27 +308,43 @@ static int send_command_data(dmdrvi_context_t context, uint8_t command, const ui
             return r_;                                                                          \
     } while (0)
 
-/* Waits while the controller works (BUSY low). The vendor gives it a millisecond to raise the line first. */
+/*
+ * Waits until the controller has done a command that keeps it busy (power on/off, a refresh): BUSY goes low when it starts and high
+ * when it is done. The start is waited for first: the controller lowers the line some time after the command. A command that is done
+ * before the line is seen low (or takes no time) ends the first wait after BUSY_START_MS. Returns the milliseconds waited (about), or
+ * a negative errno.
+ */
+#define BUSY_START_MS               20U
+
 static int wait_busy(dmdrvi_context_t context)
 {
-    dmosi_thread_sleep(1);
-    for (uint32_t waited = 0; waited < BUSY_TIMEOUT_MS; waited += BUSY_POLL_MS)
+    int level = 1;
+    uint32_t start = 0;
+    for (; start < BUSY_START_MS && level != 0; start++)
     {
-        int level = gpio_get(&context->busy);
-        if (level < 0)
+        if ((level = gpio_get(&context->busy)) < 0)
             return level;
         if (level != 0)
-            return 0;
+            dmosi_thread_sleep(1);
+    }
+    for (uint32_t waited = 0; waited < BUSY_TIMEOUT_MS; waited += BUSY_POLL_MS)
+    {
+        if ((level = gpio_get(&context->busy)) < 0)
+            return level;
+        if (level != 0)
+            return (int)(start + waited);
         dmosi_thread_sleep(BUSY_POLL_MS);
     }
     DMOD_LOG_ERROR("UC8253: BUSY did not go high in %u ms\n", (unsigned)BUSY_TIMEOUT_MS);
     return -ETIMEDOUT;
 }
 
-/* The controller is reset (the line, when there is one) and its panel setting is made: 0x1F = the waveforms of the OTP, KW, the scan as it is */
+/* A soft reset and the panel setting, as the vendor's library starts every sequence of writes (the pictures in the RAM of the controller
+ * stay: a partial refresh needs the old one). The first time the controller is also reset by the line, when there is one: it may be asleep
+ * (the firmware that was there before can have put it into deep sleep, only the line wakes it, no command does). */
 static int controller_init(dmdrvi_context_t context)
 {
-    if (context->reset.path != NULL)
+    if (!context->awake && context->reset.path != NULL)
     {
         (void)gpio_set(&context->reset, true);
         dmosi_thread_sleep(10);
@@ -318,13 +353,17 @@ static int controller_init(dmdrvi_context_t context)
         (void)gpio_set(&context->reset, true);
         dmosi_thread_sleep(10);
     }
-    else
-    {
-        COMMAND(context, CMD_PSR, 0x1E, 0x0D);                  /* soft reset */
-        dmosi_thread_sleep(2);
-    }
-    COMMAND(context, CMD_PSR, 0x1F, 0x0D);
-    return 0;
+    COMMAND(context, CMD_PSR, 0x1E, 0x0D);                      /* soft reset */
+    dmosi_thread_sleep(2);
+    context->awake = true;
+    /* 0x1F: the waveforms of the OTP, black and white (KW), the lines scanned up (UD), the columns shifted right (SHL), booster on, no reset;
+       a mirror reverses a scan direction */
+    uint8_t psr[2] = { 0x1F, 0x0D };
+    if (context->config.mirror == dmuc8253_mirror_x || context->config.mirror == dmuc8253_mirror_xy)
+        psr[0] &= (uint8_t)~PSR_SHL;
+    if (context->config.mirror == dmuc8253_mirror_y || context->config.mirror == dmuc8253_mirror_xy)
+        psr[0] &= (uint8_t)~PSR_UD;
+    return send_command_data(context, CMD_PSR, psr, sizeof(psr));
 }
 
 static int set_window(dmdrvi_context_t context, const uc8253_window_t *w)
@@ -335,27 +374,31 @@ static int set_window(dmdrvi_context_t context, const uc8253_window_t *w)
     return send_command_data(context, CMD_PTL, window, sizeof(window));
 }
 
-/* The picture of the clients of [x0, x1] x [y0, y1] into the picture register (CMD_DTM1: old, CMD_DTM2: new) of the controller */
+/* The picture of the clients of a window into the picture register (CMD_DTM1: old, CMD_DTM2: new) of the controller. The whole screen goes
+ * without a partial window (as the vendor's clearScreen does), a window of it between PTIN and PTOUT. */
 static int write_picture(dmdrvi_context_t context, uint8_t reg, const uc8253_window_t *w)
 {
     const dmuc8253_config_t *c = &context->config;
     uc8253_pack_window(c->rotation, c->width, c->height, context->framebuffer, context->stride, w, context->packed);
-    int ret = send_command(context, CMD_PTIN);
-    if (ret == 0)
+    bool whole = w->x0 == 0U && w->y0 == 0U && w->x1 == context->config.width - 1U && w->y1 == context->config.height - 1U;
+    int ret = whole ? 0 : send_command(context, CMD_PTIN);
+    if (ret == 0 && !whole)
         ret = set_window(context, w);
     if (ret == 0)
         ret = send_command(context, reg);
     if (ret != 0)
         return ret;
     ret = send_data(context, context->packed, uc8253_window_bytes(w));
-    return ret != 0 ? ret : send_command(context, CMD_PTOUT);
+    return (ret != 0 || whole) ? ret : send_command(context, CMD_PTOUT);
 }
 
 /* A command, and the wait until the controller has done it */
 static int command_and_wait(dmdrvi_context_t context, uint8_t command)
 {
     int ret = send_command(context, command);
-    return ret != 0 ? ret : wait_busy(context);
+    if (ret == 0)
+        ret = wait_busy(context);
+    return ret < 0 ? ret : 0;
 }
 
 /* Turns the screen into the new picture: a full refresh (the whole screen) or a partial one (the window) */
@@ -401,8 +444,12 @@ static int show(dmdrvi_context_t context, uint32_t x0, uint32_t y0, uint32_t x1,
     if (full)
     {
         /* Both pictures are the new one: nothing is left of what was on the screen before */
-        if ((ret = write_picture(context, CMD_DTM1, &w)) != 0 || (ret = write_picture(context, CMD_DTM2, &w)) != 0 ||
-            (ret = refresh(context, &w, true)) != 0)
+        ret = write_picture(context, CMD_DTM1, &w);
+        if (ret == 0)
+            ret = write_picture(context, CMD_DTM2, &w);
+        if (ret == 0)
+            ret = refresh(context, &w, true);
+        if (ret != 0)
             return ret;
         context->partial_count = 0;
         return 0;
@@ -492,6 +539,7 @@ static void try_start(dmdrvi_context_t context)
     else
     {
         context->started = false;
+        context->awake = false;
         DMOD_LOG_ERROR("UC8253: the start failed (%d; SPI / D/C / BUSY nodes: %s / %s / %s)\n", ret, context->spi.path,
                        context->dc.path, context->busy.path);
     }

@@ -19,7 +19,7 @@ wherever those do. The panel is portrait; `rotation=90` makes the node landscape
 
 One `friends_group` holds the display and everything it is wired to; `friend_role` says who is who (`spi`, `dc`, `busy`, `reset`;
 `chip_select` is the business of dmspi). [configs/board/t-deck-pro/display.ini](configs/board/t-deck-pro/display.ini) is the whole display of
-the T-Deck Pro (it also holds the chip selects of the SD card and the radio that share the bus). In the flash modules of the board:
+the T-Deck Pro V1.1 (with its reset line; `display-v1.0.ini` is for V1.0, which has none; it also holds the chip selects of the SD card and the radio that share the bus). In the flash modules of the board:
 
 ```text
 dmdma driver=mcu/esp32s3.ini

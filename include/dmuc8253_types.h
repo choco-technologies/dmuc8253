@@ -20,6 +20,19 @@ typedef enum
 } dmuc8253_rotation_t;
 
 /**
+ * @brief Mirroring of the panel: the scan directions of the controller (PSR: SHL for the columns, UD for the lines)
+ *
+ * How the panel is mounted in the device: the picture of the controller's default scan can appear mirrored. Applied before the rotation.
+ */
+typedef enum
+{
+    dmuc8253_mirror_none = 0,
+    dmuc8253_mirror_x,                      /**< Left and right swapped */
+    dmuc8253_mirror_y,                      /**< Top and bottom swapped */
+    dmuc8253_mirror_xy,                     /**< Both (the same as a rotation by 180) */
+} dmuc8253_mirror_t;
+
+/**
  * @brief Configuration of a display (the ini section of the driver)
  */
 typedef struct
@@ -27,6 +40,7 @@ typedef struct
     uint16_t            width;                  /**< Width of the panel in rotation 0, pixels (a multiple of 8, 8..240) */
     uint16_t            height;                 /**< Height of the panel in rotation 0, lines (1..320) */
     dmuc8253_rotation_t rotation;               /**< Rotation of the picture */
+    dmuc8253_mirror_t   mirror;                 /**< Mirroring of the panel (the scan directions of the controller) */
     bool                partial;                /**< Updates of an area refresh just that area (fast, 0.7 s); off: always the whole screen, slowly */
     uint16_t            full_refresh_interval;  /**< A full refresh (1.1 s, clears the ghosts) after this many partial ones; 0: never */
     uint32_t            clear_color;            /**< 0xAARRGGBB the framebuffer starts with: the background of the splash screen */
