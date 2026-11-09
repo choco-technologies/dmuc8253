@@ -89,6 +89,14 @@ struct dmdrvi_context
     bool                display_enabled;
     uint32_t            partial_count;      /**< Partial refreshes since the last full one */
     area_t              dirty;              /**< Written through write() / FILL_RECT, not presented yet */
+    /* settle_ms: the refresh is made by a thread of the driver (see present()) */
+    dmosi_thread_t      worker;
+    dmosi_semaphore_t   wake;               /**< Posted when an area is pending */
+    dmosi_mutex_t       pending_lock;       /**< Only the pending area (the panel's lock is held for a whole refresh) */
+    dmosi_mutex_t       plane_lock;         /**< The plane: the thread packs from it while PRESENT makes the 1-bit picture of a new frame */
+    area_t              pending;            /**< Presented, not refreshed yet; x0 > x1: nothing */
+    uint32_t            due;                /**< Tick of the refresh of the pending area */
+    bool                stopping;
 };
 
 static bool is_valid_context(dmdrvi_context_t context)
@@ -102,7 +110,8 @@ dmod_dmuc8253_api_declaration(1.0, bool, _validate_config, ( const dmuc8253_conf
 {
     if (config == NULL || config->width == 0 || config->height == 0 || config->rotation > dmuc8253_rotation_270)
         return false;
-    if (config->mirror > dmuc8253_mirror_xy || config->pixel_format > dmuc8253_pixel_format_rgb565 || config->threshold == 0)
+    if (config->mirror > dmuc8253_mirror_xy || config->pixel_format > dmuc8253_pixel_format_rgb565 || config->threshold == 0 ||
+        config->settle_ms > 2000U || (config->settle_ms != 0U && config->pixel_format != dmuc8253_pixel_format_rgb565))
         return false;
     return config->width <= UC8253_PANEL_MAX_WIDTH && config->height <= UC8253_PANEL_MAX_HEIGHT && (config->width % 8U) == 0U;
 }
@@ -219,6 +228,19 @@ static int read_config(dmdrvi_context_t context, dmini_context_t ini)
         return -EINVAL;
     }
     c->threshold = (uint8_t)threshold;
+    int settle = dmini_get_int(ini, NULL, "settle_ms", 0);
+    if (settle < 0 || settle > 2000)
+    {
+        DMOD_LOG_ERROR("Invalid settle_ms %d (0..2000)\n", settle);
+        return -EINVAL;
+    }
+    c->settle_ms = (uint16_t)settle;
+    if (c->settle_ms != 0U && c->pixel_format != dmuc8253_pixel_format_rgb565)
+    {
+        /* The 1-bit picture of a frame is made when it is presented: a client of a MONO1 framebuffer draws into the plane itself */
+        DMOD_LOG_ERROR("settle_ms needs pixel_format=rgb565\n");
+        return -EINVAL;
+    }
     context->reset_wired = string_to_switch(dmini_get_string(ini, NULL, "reset", NULL), false);
     context->display_enabled = string_to_switch(dmini_get_string(ini, NULL, "display", NULL), true);
 
@@ -387,6 +409,18 @@ static int controller_init(dmdrvi_context_t context)
     return send_command_data(context, CMD_PSR, psr, sizeof(psr));
 }
 
+static void plane_lock(dmdrvi_context_t context)
+{
+    if (context->plane_lock != NULL)
+        dmosi_mutex_lock(context->plane_lock);
+}
+
+static void plane_unlock(dmdrvi_context_t context)
+{
+    if (context->plane_lock != NULL)
+        dmosi_mutex_unlock(context->plane_lock);
+}
+
 static int set_window(dmdrvi_context_t context, const uc8253_window_t *w)
 {
     uint8_t window[7] = {
@@ -395,12 +429,21 @@ static int set_window(dmdrvi_context_t context, const uc8253_window_t *w)
     return send_command_data(context, CMD_PTL, window, sizeof(window));
 }
 
-/* The picture of the clients of a window into the picture register (CMD_DTM1: old, CMD_DTM2: new) of the controller. The whole screen goes
- * without a partial window (as the vendor's clearScreen does), a window of it between PTIN and PTOUT. */
-static int write_picture(dmdrvi_context_t context, uint8_t reg, const uc8253_window_t *w)
+/* The window of the plane packed for the controller (into context->packed). The plane may change while the panel is refreshed (a frame
+ * presented meanwhile), so this is done once for a refresh: what is sent as the new picture is what the panel will show, and the same bytes are
+ * the old picture afterwards - the controller compares the two in the next partial refresh. */
+static void pack_picture(dmdrvi_context_t context, const uc8253_window_t *w)
 {
     const dmuc8253_config_t *c = &context->config;
+    plane_lock(context);
     uc8253_pack_window(c->rotation, c->width, c->height, context->plane, context->stride, w, context->packed);
+    plane_unlock(context);
+}
+
+/* The packed window into the picture register (CMD_DTM1: old, CMD_DTM2: new) of the controller. The whole screen goes without a partial
+ * window (as the vendor's clearScreen does), a window of it between PTIN and PTOUT. */
+static int send_picture(dmdrvi_context_t context, uint8_t reg, const uc8253_window_t *w)
+{
     bool whole = w->x0 == 0U && w->y0 == 0U && w->x1 == context->config.width - 1U && w->y1 == context->config.height - 1U;
     int ret = whole ? 0 : send_command(context, CMD_PTIN);
     if (ret == 0 && !whole)
@@ -465,9 +508,10 @@ static int show(dmdrvi_context_t context, uint32_t x0, uint32_t y0, uint32_t x1,
     if (full)
     {
         /* Both pictures are the new one: nothing is left of what was on the screen before */
-        ret = write_picture(context, CMD_DTM1, &w);
+        pack_picture(context, &w);
+        ret = send_picture(context, CMD_DTM1, &w);
         if (ret == 0)
-            ret = write_picture(context, CMD_DTM2, &w);
+            ret = send_picture(context, CMD_DTM2, &w);
         if (ret == 0)
             ret = refresh(context, &w, true);
         if (ret != 0)
@@ -475,10 +519,11 @@ static int show(dmdrvi_context_t context, uint32_t x0, uint32_t y0, uint32_t x1,
         context->partial_count = 0;
         return 0;
     }
-    if ((ret = write_picture(context, CMD_DTM2, &w)) != 0 || (ret = refresh(context, &w, false)) != 0)
+    pack_picture(context, &w);
+    if ((ret = send_picture(context, CMD_DTM2, &w)) != 0 || (ret = refresh(context, &w, false)) != 0)
         return ret;
-    /* The old picture is what is on the screen now */
-    if ((ret = controller_init(context)) != 0 || (ret = write_picture(context, CMD_DTM1, &w)) != 0)
+    /* The old picture is what is on the screen now: the bytes that were sent as the new one (not the plane: it may be a later frame) */
+    if ((ret = controller_init(context)) != 0 || (ret = send_picture(context, CMD_DTM1, &w)) != 0)
         return ret;
     context->partial_count++;
     return 0;
@@ -538,8 +583,8 @@ static void fill_rect(dmdrvi_context_t context, const dmdrvi_gfx_fill_rect_t *re
     dirty_add(context, rect->x, rect->y, (uint16_t)(rect->x + w - 1U), (uint16_t)(rect->y + h - 1U));
 }
 
-/* PRESENT: the area (NULL: all) goes to the screen. The first one, and every full_refresh_interval-th, is a full refresh. */
-static int present(dmdrvi_context_t context, const dmdrvi_gfx_rect_t *area, bool force_full)
+/* The area (NULL: all) goes to the screen now. The first one, and every full_refresh_interval-th, is a full refresh. */
+static int present_now(dmdrvi_context_t context, const dmdrvi_gfx_rect_t *area, bool force_full, bool convert)
 {
     const dmuc8253_config_t *c = &context->config;
     uint32_t x0 = 0, y0 = 0, x1 = context->width - 1U, y1 = context->height - 1U;
@@ -553,7 +598,7 @@ static int present(dmdrvi_context_t context, const dmdrvi_gfx_rect_t *area, bool
         y1 = y0 + area->height - 1U > y1 ? y1 : y0 + area->height - 1U;
     }
     dmosi_mutex_lock(context->lock);
-    if (is_rgb565(context))                                     /* the 1-bit picture of what the clients drew */
+    if (convert && is_rgb565(context))                          /* the 1-bit picture of what the clients drew */
         uc8253_rgb565_to_plane(context->framebuffer, context->fb_stride, context->plane, context->stride, x0, y0, x1, y1, c->threshold);
     bool full = force_full || !c->partial ||
                 (c->full_refresh_interval != 0U && context->partial_count >= c->full_refresh_interval);
@@ -562,6 +607,94 @@ static int present(dmdrvi_context_t context, const dmdrvi_gfx_rect_t *area, bool
         dirty_clear(context);
     dmosi_mutex_unlock(context->lock);
     return ret;
+}
+
+static void pending_add(dmdrvi_context_t context, const dmdrvi_gfx_rect_t *area)
+{
+    area_t *p = &context->pending;
+    uint16_t x0 = 0, y0 = 0, x1 = (uint16_t)(context->width - 1U), y1 = (uint16_t)(context->height - 1U);
+    if (area != NULL)
+    {
+        if (area->x >= context->width || area->y >= context->height || area->width == 0 || area->height == 0)
+            return;
+        x0 = area->x;
+        y0 = area->y;
+        x1 = (uint16_t)(x0 + area->width - 1U > x1 ? x1 : x0 + area->width - 1U);
+        y1 = (uint16_t)(y0 + area->height - 1U > y1 ? y1 : y0 + area->height - 1U);
+    }
+    if (p->x0 > p->x1)
+    {
+        *p = (area_t){ x0, y0, x1, y1 };
+        context->due = dmosi_get_tick_count() + context->config.settle_ms;      /* the first one starts the wait: it is not prolonged */
+        dmosi_semaphore_post(context->wake, 1);
+        return;
+    }
+    p->x0 = x0 < p->x0 ? x0 : p->x0;
+    p->y0 = y0 < p->y0 ? y0 : p->y0;
+    p->x1 = x1 > p->x1 ? x1 : p->x1;
+    p->y1 = y1 > p->y1 ? y1 : p->y1;
+}
+
+/*
+ * The thread of settle_ms: waits until the pending area is due and refreshes it - the whole of what was presented meanwhile, from the
+ * framebuffer as it is then. A button shown pressed and the page the touch opens a moment later are one refresh, not two (0.7 s each);
+ * and the client is not held up by the refresh. What is drawn into the framebuffer during the refresh is presented again, so it is shown
+ * by the next one.
+ */
+static void worker_main(void *arg)
+{
+    dmdrvi_context_t context = arg;
+    while (!context->stopping)
+    {
+        (void)dmosi_semaphore_wait(context->wake, 1, -1);
+        for (;;)
+        {
+            int32_t left = (int32_t)(context->due - dmosi_get_tick_count());
+            if (left <= 0 || context->stopping)
+                break;
+            dmosi_thread_sleep((uint32_t)(left < 20 ? left : 20));
+        }
+        if (context->stopping)
+            break;
+        dmosi_mutex_lock(context->pending_lock);
+        area_t a = context->pending;
+        context->pending = (area_t){ 1, 1, 0, 0 };
+        dmosi_mutex_unlock(context->pending_lock);
+        if (a.x0 > a.x1)
+            continue;
+        dmdrvi_gfx_rect_t rect = { a.x0, a.y0, (uint16_t)(a.x1 - a.x0 + 1U), (uint16_t)(a.y1 - a.y0 + 1U) };
+        (void)present_now(context, &rect, false, false);
+    }
+}
+
+/* PRESENT: refreshed now, or - with settle_ms - by the thread of the driver after a moment */
+static int present(dmdrvi_context_t context, const dmdrvi_gfx_rect_t *area, bool force_full)
+{
+    if (context->worker == NULL || force_full)
+        return present_now(context, area, force_full, true);
+    /* The frame is finished now (the client has presented it): its 1-bit picture is made now, not when the thread gets to it - the client
+     * goes on drawing the next frame into the framebuffer, and a refresh must not catch it half drawn */
+    {
+        uint32_t x0 = 0, y0 = 0, x1 = context->width - 1U, y1 = context->height - 1U;
+        if (area != NULL)
+        {
+            if (area->x >= context->width || area->y >= context->height || area->width == 0 || area->height == 0)
+                return 0;
+            x0 = area->x;
+            y0 = area->y;
+            x1 = x0 + area->width - 1U > x1 ? x1 : x0 + area->width - 1U;
+            y1 = y0 + area->height - 1U > y1 ? y1 : y0 + area->height - 1U;
+        }
+        plane_lock(context);
+        uc8253_rgb565_to_plane(context->framebuffer, context->fb_stride, context->plane, context->stride, x0, y0, x1, y1,
+                               context->config.threshold);
+        plane_unlock(context);
+    }
+    dmosi_mutex_lock(context->pending_lock);
+    pending_add(context, area);
+    dmosi_mutex_unlock(context->pending_lock);
+    dirty_clear(context);
+    return 0;
 }
 
 /* Starts the panel once the required friends are there (whichever order they come in) and shows the framebuffer: the splash screen */
@@ -646,6 +779,27 @@ static void sync_framebuffer(dmdrvi_context_t context)
 
 /* ---- DMDRVI interface ---- */
 
+static void worker_stop(dmdrvi_context_t context)
+{
+    if (context->worker != NULL)
+    {
+        context->stopping = true;
+        dmosi_semaphore_post(context->wake, 1);
+        (void)dmosi_thread_join(context->worker);
+        dmosi_thread_destroy(context->worker);
+        context->worker = NULL;
+    }
+    if (context->wake != NULL)
+        dmosi_semaphore_destroy(context->wake);
+    if (context->pending_lock != NULL)
+        dmosi_mutex_destroy(context->pending_lock);
+    if (context->plane_lock != NULL)
+        dmosi_mutex_destroy(context->plane_lock);
+    context->wake = NULL;
+    context->pending_lock = NULL;
+    context->plane_lock = NULL;
+}
+
 dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, dmdrvi_context_t, _create, ( dmini_context_t config, dmdrvi_dev_num_t* dev_num ))
 {
     if (config == NULL || dev_num == NULL)
@@ -676,12 +830,24 @@ dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, dmdrvi_context_t, _create, ( dmin
                                context->height - 1U, context->config.threshold);
     show_splash(context, splash_logo_path(config));
     sync_framebuffer(context);
+    context->pending = (area_t){ 1, 1, 0, 0 };
+    if (context->config.settle_ms != 0U)
+    {
+        context->pending_lock = dmosi_mutex_create(false);
+        context->plane_lock = dmosi_mutex_create(false);
+        context->wake = dmosi_semaphore_create(0, 1);
+        if (context->pending_lock != NULL && context->plane_lock != NULL && context->wake != NULL)
+            context->worker = dmosi_thread_create(worker_main, context, 2, 4096, "uc8253", dmosi_process_current());
+        if (context->worker == NULL)
+            DMOD_LOG_ERROR("UC8253: no thread for settle_ms - the panel is refreshed by PRESENT itself\n");
+    }
 
     dev_num->flags = DMDRVI_NUM_MAJOR;
     dev_num->major = (dmdrvi_dev_id_t)context->instance;
     return context;
 
 fail:
+    worker_stop(context);
     if (context->lock != NULL)
         dmosi_mutex_destroy(context->lock);
     if (context->plane != context->framebuffer)
@@ -697,6 +863,7 @@ dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, void, _free, ( dmdrvi_context_t c
 {
     if (!is_valid_context(context))
         return;
+    worker_stop(context);
     /* The nodes of the friends are not touched: dmdevfs tears them down before this call, in reverse order of the sections */
     Dmod_Free(context->spi.path);
     Dmod_Free(context->dc.path);

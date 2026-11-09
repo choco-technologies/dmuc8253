@@ -310,3 +310,14 @@ DMOD_TEST_STEP(plane_becomes_an_rgb565_framebuffer)
         DMOD_TEST_EXPECT_EQ(fb[x * 2 + 1], white ? 0xFF : 0x00);
     }
 }
+
+DMOD_TEST_STEP(validate_checks_settle_ms)
+{
+    dmuc8253_config_t c = panel();
+    c.settle_ms = 150;                                                  /* the 1-bit picture is made when a frame is presented: rgb565 only */
+    DMOD_TEST_EXPECT_FALSE(dmuc8253_validate_config(&c));
+    c.pixel_format = dmuc8253_pixel_format_rgb565;
+    DMOD_TEST_EXPECT_TRUE(dmuc8253_validate_config(&c));
+    c.settle_ms = 2001;
+    DMOD_TEST_EXPECT_FALSE(dmuc8253_validate_config(&c));
+}

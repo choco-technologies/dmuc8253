@@ -58,6 +58,9 @@ typedef struct
     uint16_t            full_refresh_interval;  /**< A full refresh (1.1 s, clears the ghosts) after this many partial ones; 0: never */
     uint32_t            clear_color;            /**< 0xAARRGGBB the framebuffer starts with: the background of the splash screen */
     dmuc8253_pixel_format_t pixel_format;       /**< Format of the framebuffer of the clients */
+    uint16_t            settle_ms;              /**< 0: PRESENT refreshes the panel and returns when it is done. More: PRESENT returns at once and a thread of
+                                                     the driver refreshes this long after the first one - what is presented meanwhile is one refresh (the
+                                                     taps of a GUI: a button shown pressed for less than this is not shown at all) */
     uint8_t             threshold;              /**< A pixel is white when its luminance (0..255) is at least this: 128 is the middle, higher
                                                      makes thin black strokes (text) bolder, lower thin white ones */
 } dmuc8253_config_t;
