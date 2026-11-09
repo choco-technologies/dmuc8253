@@ -33,6 +33,19 @@ typedef enum
 } dmuc8253_mirror_t;
 
 /**
+ * @brief The pixel format of the framebuffer the clients draw into
+ *
+ * The panel is black and white, so the controller always gets 1 bit per pixel. A client that draws in colors (a GUI such as dmview
+ * draws RGB565 or ARGB8888 only) draws into an RGB565 framebuffer, and the driver makes the 1-bit picture of the area it presents:
+ * a pixel is white when its luminance is at least the threshold.
+ */
+typedef enum
+{
+    dmuc8253_pixel_format_mono1 = 0,        /**< 1 bit per pixel, set = white: what the panel shows, nothing is converted */
+    dmuc8253_pixel_format_rgb565,           /**< 16 bits per pixel, converted to 1 bit when an area is presented */
+} dmuc8253_pixel_format_t;
+
+/**
  * @brief Configuration of a display (the ini section of the driver)
  */
 typedef struct
@@ -44,6 +57,12 @@ typedef struct
     bool                partial;                /**< Updates of an area refresh just that area (fast, 0.7 s); off: always the whole screen, slowly */
     uint16_t            full_refresh_interval;  /**< A full refresh (1.1 s, clears the ghosts) after this many partial ones; 0: never */
     uint32_t            clear_color;            /**< 0xAARRGGBB the framebuffer starts with: the background of the splash screen */
+    dmuc8253_pixel_format_t pixel_format;       /**< Format of the framebuffer of the clients */
+    uint16_t            settle_ms;              /**< 0: PRESENT refreshes the panel and returns when it is done. More: PRESENT returns at once and a thread of
+                                                     the driver refreshes this long after the first one - what is presented meanwhile is one refresh (the
+                                                     taps of a GUI: a button shown pressed for less than this is not shown at all) */
+    uint8_t             threshold;              /**< A pixel is white when its luminance (0..255) is at least this: 128 is the middle, higher
+                                                     makes thin black strokes (text) bolder, lower thin white ones */
 } dmuc8253_config_t;
 
 /** @brief The framebuffer a splash logo is drawn into (MONO1: 8 pixels per byte, the leftmost in the top bit, set = white) */
