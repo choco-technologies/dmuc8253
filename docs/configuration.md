@@ -11,6 +11,8 @@ The section of the display (`driver_name=dmuc8253`):
 | `partial` | yes | an update of an area refreshes just that area (fast, 0.7 s); `no`: always the whole screen, a full refresh |
 | `full_refresh_interval` | 0 | a full refresh (1.1 s, clears the ghosts) after this many partial ones; 0: never |
 | `clear_color` | 0xFFFFFFFF | 0xAARRGGBB the framebuffer starts with (white); the background of the splash screen |
+| `pixel_format` | mono1 | the framebuffer of the clients: `mono1` (1 bit per pixel, what the panel shows) or `rgb565` - for a GUI that draws in colors (dmview draws RGB565 or ARGB8888 only): the driver makes the 1-bit picture of the area it presents, a pixel is white when its luminance is at least `threshold`. RGB565 costs 2 bytes per pixel (150 kB for 240 x 320) |
+| `threshold` | 128 | 1..255, with `rgb565` (and for the colors of `FILL_RECT`): white from this luminance. Higher makes thin black strokes (text) bolder, lower thin white ones (text on black) |
 | `splash_logo` | `$SPLASH_LOGO` | path of the splash logo (`.dmvir`) drawn in the middle of the screen at start; `none`: no logo |
 | `reset` | no | `yes`: the panel waits for a `reset` friend before it is started, and the controller is reset by the line the first time (a controller left in deep sleep by the firmware that was there before is woken only by the line); later resets are the soft reset command, which keeps the pictures in its RAM. Without a line the controller is reset by command |
 | `display` | on | the state reported by `GFX_GET_DISPLAY_ENABLED` (the screen keeps its picture without power) |

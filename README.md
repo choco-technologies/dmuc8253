@@ -6,7 +6,7 @@ LilyGO T-Deck Pro.
 [![CI](https://github.com/choco-technologies/dmuc8253/actions/workflows/ci.yml/badge.svg)](https://github.com/choco-technologies/dmuc8253/actions/workflows/ci.yml)
 
 The controller keeps two pictures in a RAM of its own: the one on the screen and the next one; a refresh turns the first into the second.
-The driver keeps a **framebuffer** (`DMDRVI_GFX_PIXEL_FORMAT_MONO1`: 1 bit per pixel, 8 pixels per byte, set = white) that clients draw into,
+The driver keeps a **framebuffer** (`DMDRVI_GFX_PIXEL_FORMAT_MONO1`: 1 bit per pixel, 8 pixels per byte, set = white - or RGB565 with `pixel_format=rgb565`, for a GUI that draws in colors: the driver then makes the 1-bit picture of what is presented) that clients draw into,
 and `PRESENT` sends the area drawn to the panel and refreshes just that area (0.7 s). The first refresh, and every
 `full_refresh_interval`-th one, is a full refresh (1.1 s, the whole screen, no ghosts). The node follows the generic graphics interface of
 [dmdrvi](https://github.com/choco-technologies/dmdrvi) (`DMDRVI_IOCTL_GFX_*`), so generic code needs only the path: `/dev/dmuc82530`.

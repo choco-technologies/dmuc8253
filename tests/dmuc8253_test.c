@@ -6,7 +6,7 @@
 
 static dmuc8253_config_t panel(void)
 {
-    dmuc8253_config_t c = { .width = 240, .height = 320, .rotation = dmuc8253_rotation_0 };
+    dmuc8253_config_t c = { .width = 240, .height = 320, .rotation = dmuc8253_rotation_0, .threshold = 128 };
     return c;
 }
 
@@ -250,4 +250,63 @@ DMOD_TEST_STEP(splash_logo_errors)
     DMOD_TEST_EXPECT_EQ(dmuc8253_splash_draw(TEST_LOGO_PATH, &t), -95);                        /* ENOTSUP */
     DMOD_TEST_EXPECT_EQ(dmuc8253_splash_draw(NULL, &t), -22);                                  /* EINVAL */
     DMOD_TEST_EXPECT_EQ(dmuc8253_splash_draw(TEST_LOGO_PATH, NULL), -22);
+}
+
+DMOD_TEST_STEP(validate_checks_the_pixel_format_and_the_threshold)
+{
+    dmuc8253_config_t c = panel();
+    c.pixel_format = dmuc8253_pixel_format_rgb565;
+    DMOD_TEST_EXPECT_TRUE(dmuc8253_validate_config(&c));
+    c.pixel_format = (dmuc8253_pixel_format_t)2;
+    DMOD_TEST_EXPECT_FALSE(dmuc8253_validate_config(&c));
+    c = panel();
+    c.threshold = 0;
+    DMOD_TEST_EXPECT_FALSE(dmuc8253_validate_config(&c));
+    c.threshold = 255;
+    DMOD_TEST_EXPECT_TRUE(dmuc8253_validate_config(&c));
+}
+
+DMOD_TEST_STEP(rgb565_pixels_are_white_from_the_threshold)
+{
+    DMOD_TEST_EXPECT_TRUE(uc8253_rgb565_is_white(0xFFFF, 128));         /* white */
+    DMOD_TEST_EXPECT_FALSE(uc8253_rgb565_is_white(0x0000, 128));        /* black */
+    DMOD_TEST_EXPECT_TRUE(uc8253_rgb565_is_white(0x07E0, 128));         /* pure green: light */
+    DMOD_TEST_EXPECT_FALSE(uc8253_rgb565_is_white(0x001F, 128));        /* pure blue: dark */
+    /* a middle gray (0x8410) is 132 of 255: white with 128, black with 160 - the threshold moves the strokes of the text */
+    DMOD_TEST_EXPECT_TRUE(uc8253_rgb565_is_white(0x8410, 128));
+    DMOD_TEST_EXPECT_FALSE(uc8253_rgb565_is_white(0x8410, 160));
+}
+
+DMOD_TEST_STEP(rgb565_area_becomes_the_plane)
+{
+    /* 16 x 2 framebuffer: the left half white, the right half black; only the first line is converted */
+    uint8_t fb[16 * 2 * 2];
+    uint8_t plane[2 * 2] = { 0x00, 0x00, 0xAA, 0xAA };
+    for (unsigned y = 0; y < 2; y++)
+        for (unsigned x = 0; x < 16; x++)
+        {
+            uint16_t p = x < 8 ? 0xFFFF : 0x0000;
+            fb[y * 32 + x * 2] = (uint8_t)p;
+            fb[y * 32 + x * 2 + 1] = (uint8_t)(p >> 8);
+        }
+    uc8253_rgb565_to_plane(fb, 32, plane, 2, 0, 0, 15, 0, 128);
+    DMOD_TEST_EXPECT_EQ(plane[0], 0xFF);
+    DMOD_TEST_EXPECT_EQ(plane[1], 0x00);
+    DMOD_TEST_EXPECT_EQ(plane[2], 0xAA);                                /* the second line was not in the area */
+    uc8253_rgb565_to_plane(fb, 32, plane, 2, 4, 1, 11, 1, 128);         /* a part of the line: only its bits change */
+    DMOD_TEST_EXPECT_EQ(plane[2], 0xAF);                                /* x 4..7 white: 1010 1111 */
+    DMOD_TEST_EXPECT_EQ(plane[3], 0x0A);                                /* x 8..11 black: 0000 1010 */
+}
+
+DMOD_TEST_STEP(plane_becomes_an_rgb565_framebuffer)
+{
+    uint8_t plane[2] = { 0xF0, 0x0F };                                  /* 16 x 1: 4 white, 8 black, 4 white... as bits */
+    uint8_t fb[16 * 2];
+    uc8253_plane_to_rgb565(plane, 2, fb, 32, 16, 1);
+    for (unsigned x = 0; x < 16; x++)
+    {
+        bool white = x < 4 || (x >= 12);
+        DMOD_TEST_EXPECT_EQ(fb[x * 2], white ? 0xFF : 0x00);
+        DMOD_TEST_EXPECT_EQ(fb[x * 2 + 1], white ? 0xFF : 0x00);
+    }
 }

@@ -14,7 +14,8 @@
  * dmuc8253: an e-paper display with a UC8253 controller on SPI (the 3.1" GDEQ031T10 of the LilyGO T-Deck Pro: 240x320, black and white).
  *
  * The controller keeps two pictures in a RAM of its own: the one on the screen ("old", command 0x10) and the next one ("new", 0x13); a
- * refresh turns the screen from the first into the second. The driver keeps a framebuffer (MONO1: 1 bit per pixel, set = white) that
+ * refresh turns the screen from the first into the second. The driver keeps a framebuffer (MONO1: 1 bit per pixel, set = white; or RGB565
+ * for clients that draw in colors - then it makes the 1-bit picture of what is presented, see pixel_format) that
  * clients draw into, and PRESENT sends the area drawn to the new picture, refreshes just that area (a partial refresh, 0.7 s, only
  * the pixels that change are driven) and then writes the area to the old picture too, so the next refresh starts from what is on the
  * screen. The very first refresh, and every full_refresh_interval-th one, is a full one (1.1 s, the whole screen, no ghosts). The node
@@ -71,9 +72,11 @@ struct dmdrvi_context
     uint8_t             instance;
     uint16_t            width;              /**< As shown (after the rotation) */
     uint16_t            height;
-    uint32_t            stride;
+    uint32_t            stride;             /**< Bytes of a line of the plane (MONO1) */
+    uint32_t            fb_stride;          /**< Bytes of a line of the framebuffer of the clients */
     uint32_t            framebuffer_size;
-    uint8_t            *framebuffer;
+    uint8_t            *framebuffer;        /**< What the clients draw into (config.pixel_format) */
+    uint8_t            *plane;              /**< The 1-bit picture the panel is sent: the framebuffer itself when that is MONO1 */
     uint8_t            *packed;             /**< The window of the panel on its way to the controller */
     dmosi_mutex_t       lock;
     node_t              spi;
@@ -99,7 +102,7 @@ dmod_dmuc8253_api_declaration(1.0, bool, _validate_config, ( const dmuc8253_conf
 {
     if (config == NULL || config->width == 0 || config->height == 0 || config->rotation > dmuc8253_rotation_270)
         return false;
-    if (config->mirror > dmuc8253_mirror_xy)
+    if (config->mirror > dmuc8253_mirror_xy || config->pixel_format > dmuc8253_pixel_format_rgb565 || config->threshold == 0)
         return false;
     return config->width <= UC8253_PANEL_MAX_WIDTH && config->height <= UC8253_PANEL_MAX_HEIGHT && (config->width % 8U) == 0U;
 }
@@ -199,6 +202,23 @@ static int read_config(dmdrvi_context_t context, dmini_context_t ini)
         DMOD_LOG_ERROR("Invalid clear_color '%s'\n", clear);
         return -EINVAL;
     }
+    const char *format = dmini_get_string(ini, NULL, "pixel_format", "mono1");
+    int threshold = dmini_get_int(ini, NULL, "threshold", 128);
+    if (strcmp(format, "mono1") == 0)
+        c->pixel_format = dmuc8253_pixel_format_mono1;
+    else if (strcmp(format, "rgb565") == 0)
+        c->pixel_format = dmuc8253_pixel_format_rgb565;
+    else
+    {
+        DMOD_LOG_ERROR("Invalid pixel_format '%s' (mono1 or rgb565)\n", format);
+        return -EINVAL;
+    }
+    if (threshold < 1 || threshold > 255)
+    {
+        DMOD_LOG_ERROR("Invalid threshold %d (1..255)\n", threshold);
+        return -EINVAL;
+    }
+    c->threshold = (uint8_t)threshold;
     context->reset_wired = string_to_switch(dmini_get_string(ini, NULL, "reset", NULL), false);
     context->display_enabled = string_to_switch(dmini_get_string(ini, NULL, "display", NULL), true);
 
@@ -211,7 +231,8 @@ static int read_config(dmdrvi_context_t context, dmini_context_t ini)
     context->width  = swap ? c->height : c->width;
     context->height = swap ? c->width : c->height;
     context->stride = ((uint32_t)context->width + 7U) / 8U;
-    context->framebuffer_size = context->stride * context->height;
+    context->fb_stride = (c->pixel_format == dmuc8253_pixel_format_rgb565) ? (uint32_t)context->width * 2U : context->stride;
+    context->framebuffer_size = context->fb_stride * context->height;
     return 0;
 }
 
@@ -379,7 +400,7 @@ static int set_window(dmdrvi_context_t context, const uc8253_window_t *w)
 static int write_picture(dmdrvi_context_t context, uint8_t reg, const uc8253_window_t *w)
 {
     const dmuc8253_config_t *c = &context->config;
-    uc8253_pack_window(c->rotation, c->width, c->height, context->framebuffer, context->stride, w, context->packed);
+    uc8253_pack_window(c->rotation, c->width, c->height, context->plane, context->stride, w, context->packed);
     bool whole = w->x0 == 0U && w->y0 == 0U && w->x1 == context->config.width - 1U && w->y1 == context->config.height - 1U;
     int ret = whole ? 0 : send_command(context, CMD_PTIN);
     if (ret == 0 && !whole)
@@ -484,17 +505,36 @@ static void dirty_clear(dmdrvi_context_t context)
     context->dirty = (area_t){ 1, 1, 0, 0 };
 }
 
+static bool is_rgb565(const dmdrvi_context_t context)
+{
+    return context->config.pixel_format == dmuc8253_pixel_format_rgb565;
+}
+
 static void fill_rect(dmdrvi_context_t context, const dmdrvi_gfx_fill_rect_t *rect)
 {
     if (rect->x >= context->width || rect->y >= context->height || rect->width == 0 || rect->height == 0)
         return;
     uint32_t w = rect->width > context->width - rect->x ? context->width - rect->x : rect->width;
     uint32_t h = rect->height > context->height - rect->y ? context->height - rect->y : rect->height;
-    bool white = dmuc8253_color_to_mono(rect->color);
+    bool white = uc8253_color_is_white_at(rect->color, context->config.threshold);
+    uint32_t r = (rect->color >> 16) & 0xFFU, g = (rect->color >> 8) & 0xFFU, b = rect->color & 0xFFU;
+    uint16_t pixel = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 
     for (uint32_t y = rect->y; y < (uint32_t)rect->y + h; y++)
+    {
         for (uint32_t x = rect->x; x < (uint32_t)rect->x + w; x++)
-            uc8253_put_pixel(context->framebuffer, context->stride, x, y, white);
+        {
+            if (is_rgb565(context))
+            {
+                context->framebuffer[y * context->fb_stride + x * 2U] = (uint8_t)pixel;
+                context->framebuffer[y * context->fb_stride + x * 2U + 1U] = (uint8_t)(pixel >> 8);
+            }
+            else
+            {
+                uc8253_put_pixel(context->framebuffer, context->stride, x, y, white);
+            }
+        }
+    }
     dirty_add(context, rect->x, rect->y, (uint16_t)(rect->x + w - 1U), (uint16_t)(rect->y + h - 1U));
 }
 
@@ -513,6 +553,8 @@ static int present(dmdrvi_context_t context, const dmdrvi_gfx_rect_t *area, bool
         y1 = y0 + area->height - 1U > y1 ? y1 : y0 + area->height - 1U;
     }
     dmosi_mutex_lock(context->lock);
+    if (is_rgb565(context))                                     /* the 1-bit picture of what the clients drew */
+        uc8253_rgb565_to_plane(context->framebuffer, context->fb_stride, context->plane, context->stride, x0, y0, x1, y1, c->threshold);
     bool full = force_full || !c->partial ||
                 (c->full_refresh_interval != 0U && context->partial_count >= c->full_refresh_interval);
     int ret = show(context, x0, y0, x1, y1, full);
@@ -582,7 +624,7 @@ static void show_splash(dmdrvi_context_t context, const char *logo_path)
     if (logo_path == NULL)
         return;
     dmuc8253_splash_target_t target = {
-        context->framebuffer, context->stride, context->width, context->height, context->config.clear_color & 0xFFFFFFU
+        context->plane, context->stride, context->width, context->height, context->config.clear_color & 0xFFFFFFU
     };
     int ret = dmuc8253_splash_draw_file(logo_path, &target);
     if (ret == -ENOENT)
@@ -593,6 +635,13 @@ static void show_splash(dmdrvi_context_t context, const char *logo_path)
     {
         DMOD_LOG_ERROR("Cannot show splash logo %s (%d)\n", logo_path, ret);
     }
+}
+
+/* The framebuffer of the clients shows what the plane does (the splash screen): a client that draws only a part of it leaves the rest */
+static void sync_framebuffer(dmdrvi_context_t context)
+{
+    if (is_rgb565(context))
+        uc8253_plane_to_rgb565(context->plane, context->stride, context->framebuffer, context->fb_stride, context->width, context->height);
 }
 
 /* ---- DMDRVI interface ---- */
@@ -612,8 +661,9 @@ dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, dmdrvi_context_t, _create, ( dmin
         goto fail;
     context->lock = dmosi_mutex_create(false);
     context->framebuffer = Dmod_Malloc(context->framebuffer_size);
+    context->plane = is_rgb565(context) ? Dmod_Malloc((size_t)context->stride * context->height) : context->framebuffer;
     context->packed = Dmod_Malloc((size_t)context->config.width / 8U * context->config.height);
-    if (context->lock == NULL || context->framebuffer == NULL || context->packed == NULL)
+    if (context->lock == NULL || context->framebuffer == NULL || context->plane == NULL || context->packed == NULL)
     {
         DMOD_LOG_ERROR("UC8253: out of memory (framebuffer %u bytes)\n", (unsigned)context->framebuffer_size);
         goto fail;
@@ -621,7 +671,11 @@ dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, dmdrvi_context_t, _create, ( dmin
     /* The picture starts as clear_color: the panel never shows the garbage of the heap */
     dmdrvi_gfx_fill_rect_t all = { 0, 0, context->width, context->height, context->config.clear_color };
     fill_rect(context, &all);
+    if (is_rgb565(context))                                     /* (the plane is what the panel is sent: the same clear color) */
+        uc8253_rgb565_to_plane(context->framebuffer, context->fb_stride, context->plane, context->stride, 0, 0, context->width - 1U,
+                               context->height - 1U, context->config.threshold);
     show_splash(context, splash_logo_path(config));
+    sync_framebuffer(context);
 
     dev_num->flags = DMDRVI_NUM_MAJOR;
     dev_num->major = (dmdrvi_dev_id_t)context->instance;
@@ -630,6 +684,8 @@ dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, dmdrvi_context_t, _create, ( dmin
 fail:
     if (context->lock != NULL)
         dmosi_mutex_destroy(context->lock);
+    if (context->plane != context->framebuffer)
+        Dmod_Free(context->plane);
     Dmod_Free(context->framebuffer);
     Dmod_Free(context->packed);
     context->magic = 0;
@@ -647,6 +703,8 @@ dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, void, _free, ( dmdrvi_context_t c
     Dmod_Free(context->busy.path);
     Dmod_Free(context->reset.path);
     dmosi_mutex_destroy(context->lock);
+    if (context->plane != context->framebuffer)
+        Dmod_Free(context->plane);
     Dmod_Free(context->framebuffer);
     Dmod_Free(context->packed);
     context->magic = 0;
@@ -708,8 +766,8 @@ dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, dmdrvi_ssize_t, _write, ( dmdrvi_
     size_t available = context->framebuffer_size - (size_t)offset;
     size_t count = size < available ? size : available;
     memcpy(context->framebuffer + offset, buffer, count);
-    uint32_t first_line = (uint32_t)offset / context->stride;
-    uint32_t last_line = ((uint32_t)offset + (uint32_t)count - 1U) / context->stride;
+    uint32_t first_line = (uint32_t)offset / context->fb_stride;
+    uint32_t last_line = ((uint32_t)offset + (uint32_t)count - 1U) / context->fb_stride;
     dirty_add(context, 0, (uint16_t)first_line, (uint16_t)(context->width - 1U), (uint16_t)last_line);
     return (dmdrvi_ssize_t)count;
 }
@@ -735,9 +793,9 @@ dmod_dmdrvi_dif_api_declaration(2.0, dmuc8253, int, _ioctl, ( dmdrvi_context_t c
             dmdrvi_gfx_info_t *info = (dmdrvi_gfx_info_t *)arg;
             info->width = context->width;
             info->height = context->height;
-            info->pixel_format = DMDRVI_GFX_PIXEL_FORMAT_MONO1;
-            info->bytes_per_pixel = 0;
-            info->stride = context->stride;
+            info->pixel_format = is_rgb565(context) ? DMDRVI_GFX_PIXEL_FORMAT_RGB565 : DMDRVI_GFX_PIXEL_FORMAT_MONO1;
+            info->bytes_per_pixel = is_rgb565(context) ? 2 : 0;
+            info->stride = context->fb_stride;
             info->framebuffer_size = context->framebuffer_size;
             info->buffer_count = 1;
             return 0;

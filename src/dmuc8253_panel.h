@@ -109,11 +109,29 @@ static inline void uc8253_pack_window(dmuc8253_rotation_t rotation, uint32_t pw,
     }
 }
 
-/** The color 0xAARRGGBB as a pixel of the framebuffer: white (true) when its luminance is 128 or more */
+/** The luminance (0..255) of a color, with the weights of the eye */
+static inline uint32_t uc8253_luminance(uint32_t r, uint32_t g, uint32_t b)
+{
+    return (r * 299U + g * 587U + b * 114U) / 1000U;
+}
+
+/** The color 0xAARRGGBB as a pixel of the framebuffer: white (true) when its luminance is at least threshold */
+static inline bool uc8253_color_is_white_at(uint32_t argb, uint32_t threshold)
+{
+    return uc8253_luminance((argb >> 16) & 0xFFU, (argb >> 8) & 0xFFU, argb & 0xFFU) >= threshold;
+}
+
+/** The same with the middle of the range as the threshold */
 static inline bool uc8253_color_is_white(uint32_t argb)
 {
-    uint32_t r = (argb >> 16) & 0xFFU, g = (argb >> 8) & 0xFFU, b = argb & 0xFFU;
-    return (r * 299U + g * 587U + b * 114U) / 1000U >= 128U;
+    return uc8253_color_is_white_at(argb, 128U);
+}
+
+/** A pixel of RGB565 (the channels stretched to 8 bits, so that white is 255) */
+static inline bool uc8253_rgb565_is_white(uint16_t p, uint32_t threshold)
+{
+    uint32_t r = ((uint32_t)(p >> 11) & 31U) * 255U / 31U, g = ((uint32_t)(p >> 5) & 63U) * 255U / 63U, b = ((uint32_t)p & 31U) * 255U / 31U;
+    return uc8253_luminance(r, g, b) >= threshold;
 }
 
 static inline void uc8253_put_pixel(uint8_t *fb, uint32_t stride, uint32_t x, uint32_t y, bool white)
@@ -121,6 +139,35 @@ static inline void uc8253_put_pixel(uint8_t *fb, uint32_t stride, uint32_t x, ui
     uint8_t mask = (uint8_t)(0x80U >> (x % 8U));
     uint8_t *byte = &fb[y * stride + x / 8U];
     *byte = white ? (uint8_t)(*byte | mask) : (uint8_t)(*byte & ~mask);
+}
+
+/** The area [x0, x1] x [y0, y1] of an RGB565 framebuffer as pixels of a MONO1 plane (stride in bytes of each) */
+static inline void uc8253_rgb565_to_plane(const uint8_t *fb, uint32_t fb_stride, uint8_t *plane, uint32_t plane_stride,
+                                          uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, uint32_t threshold)
+{
+    for (uint32_t y = y0; y <= y1; y++)
+    {
+        const uint8_t *line = fb + y * fb_stride;
+        for (uint32_t x = x0; x <= x1; x++)
+        {
+            uint16_t p = (uint16_t)(line[x * 2U] | (line[x * 2U + 1U] << 8));
+            uc8253_put_pixel(plane, plane_stride, x, y, uc8253_rgb565_is_white(p, threshold));
+        }
+    }
+}
+
+/** The whole MONO1 plane of w x h pixels as black and white pixels of an RGB565 framebuffer */
+static inline void uc8253_plane_to_rgb565(const uint8_t *plane, uint32_t plane_stride, uint8_t *fb, uint32_t fb_stride, uint32_t w, uint32_t h)
+{
+    for (uint32_t y = 0; y < h; y++)
+    {
+        for (uint32_t x = 0; x < w; x++)
+        {
+            uint16_t p = uc8253_get_bit(plane, plane_stride, x, y) ? 0xFFFFU : 0x0000U;
+            fb[y * fb_stride + x * 2U] = (uint8_t)p;
+            fb[y * fb_stride + x * 2U + 1U] = (uint8_t)(p >> 8);
+        }
+    }
 }
 
 #endif /* DMUC8253_PANEL_H */

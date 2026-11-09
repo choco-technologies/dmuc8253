@@ -8,7 +8,7 @@ at a byte offset (`DMDRVI_GFX_PIXEL_FORMAT_MONO1`: 8 pixels per byte, the leftmo
 
 | Command | |
 |---|---|
-| `DMDRVI_IOCTL_GFX_GET_INFO` | `dmdrvi_gfx_info_t`: the size as shown (after the rotation), MONO1, `bytes_per_pixel` 0, stride, 1 buffer |
+| `DMDRVI_IOCTL_GFX_GET_INFO` | `dmdrvi_gfx_info_t`: the size as shown (after the rotation), MONO1 (`bytes_per_pixel` 0) or RGB565 (2) as `pixel_format` says, stride, 1 buffer |
 | `DMDRVI_IOCTL_GFX_GET_FRAMEBUFFER` | the address of the framebuffer, to draw into directly; then `PRESENT` the area drawn |
 | `DMDRVI_IOCTL_GFX_FILL_RECT` | fills a rectangle of the framebuffer (clipped; color 0xAARRGGBB: white from a luminance of 128, black below); not shown until `PRESENT` |
 | `DMDRVI_IOCTL_GFX_PRESENT` | sends `area` (NULL: the whole screen) to the screen and refreshes it; blocks 0.7 s (partial) or 1.1 s (full) |
